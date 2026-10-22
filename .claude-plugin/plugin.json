@@ -1,0 +1,6 @@
+{
+  "name": "busyline",
+  "version": "0.1.0",
+  "description": "A train above the prompt that rolls while Claude works",
+  "types": "./types/index.d.ts"
+}

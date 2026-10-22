@@ -1,0 +1,14 @@
+#!/bin/sh
+# hooks/themes/custom/ is the local theme slot: whatever is put there stays
+# on this machine. Enable with: git config core.hooksPath .githooks
+# Changing the stub on purpose: BUSYLINE_ALLOW_SLOT=1 git commit ...
+
+[ "$BUSYLINE_ALLOW_SLOT" = 1 ] && exit 0
+
+staged=$(git diff --cached --name-only -- hooks/themes/custom/)
+if [ -n "$staged" ]; then
+  echo "busyline: hooks/themes/custom/ is the local theme slot and is not committed:" >&2
+  echo "$staged" | sed 's/^/  /' >&2
+  echo "Unstage it with: git restore --staged hooks/themes/custom/" >&2
+  exit 1
+fi

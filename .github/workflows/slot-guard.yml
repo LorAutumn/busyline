@@ -1,0 +1,29 @@
+name: slot-guard
+
+# hooks/themes/custom/ is a slot for local themes. In the repository it holds
+# exactly one file, the stub that points at the railcar.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  slot-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The slot holds only the stub
+        run: |
+          files=$(git ls-files hooks/themes/custom)
+          if [ "$files" != "hooks/themes/custom/index.ts" ]; then
+            echo "::error::hooks/themes/custom/ must hold only index.ts, found:"
+            echo "$files"
+            exit 1
+          fi
+          if ! printf "export * from '../railcar'\n" | cmp -s - hooks/themes/custom/index.ts; then
+            echo "::error::hooks/themes/custom/index.ts differs from the stub"
+            exit 1
+          fi
