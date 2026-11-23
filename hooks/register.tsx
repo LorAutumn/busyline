@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
+import { remoteIds, remoteSessions } from './remote'
 import { MAX_CHECKED, sessionIds, startedSessions } from './sessions'
 import { DEFAULT_THEME, THEMES, themeOf } from './themes'
 import type { Background, Shell } from '../types'
@@ -113,6 +114,45 @@ async function checkSessions($: EngineInterface, isFirstLook: boolean): Promise<
   if (!same) await update($, background, b => ({ ...b, sessions: running }))
 }
 
+// Cloud sessions this one started through Claude Code Remote: asked about
+// one by one while any is watched. `added` are ones just started or
+// written to.
+let isSyncingRemote = false
+let remoteUnanswered = 0
+async function syncRemote($: EngineInterface, added: readonly string[] = []): Promise<void> {
+  if (added.length > 0) {
+    remoteUnanswered = 0
+    await update($, background, b => ({
+      ...b,
+      remoteIds: [...new Set([...(b.remoteIds ?? []), ...added])].slice(-MAX_CHECKED),
+    }))
+  }
+  if (isSyncingRemote) return
+  isSyncingRemote = true
+  try {
+    const ids = (await read($, background)).remoteIds ?? []
+    if (ids.length === 0) return
+    const remote = await remoteSessions($, ids)
+    if (remote === undefined) {
+      // No answer: keep what is known, and give up only when it lasts.
+      remoteUnanswered += 1
+      if (remoteUnanswered >= MAX_UNANSWERED) {
+        await update($, background, b => ({ ...b, remote: [], remoteIds: [] }))
+      }
+      return
+    }
+    remoteUnanswered = 0
+    // Ids added while the answers came are kept.
+    await update($, background, b => ({
+      ...b,
+      remote: remote.running,
+      remoteIds: (b.remoteIds ?? []).filter(id => remote.watched.includes(id) || !ids.includes(id)),
+    }))
+  } finally {
+    isSyncingRemote = false
+  }
+}
+
 async function watchSessions($: EngineInterface, graceMs: number, isFirstLook = false): Promise<void> {
   unanswered = 0
   const until = (await $.clock.now()) + graceMs
@@ -223,6 +263,7 @@ export const register: Register = on => {
     // Timers outlive a dispatch only when started here. While the watch is
     // off a tick reads the state and returns.
     $.clock.every(SESSIONS_MS, () => syncSessions($))
+    $.clock.every(SESSIONS_MS, () => syncRemote($))
 
     // A resumed conversation may have started sessions before: one look,
     // not awaited, so a slow app does not hold up the session's start.
@@ -329,12 +370,30 @@ export const register: Register = on => {
     return ran
   })
 
+  // A cloud session starts its children through Claude Code Remote.
+  on('tool.call', { tool: 'mcp__claude-code-remote__create_session' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && !ran.isError) await syncRemote($, remoteIds(ran.text ?? ran.result))
+    return ran
+  })
+
+  // A message sets the session it names to work again.
+  on('tool.call', { tool: 'mcp__claude-code-remote__send_message' }, async ($, e, next) => {
+    const ran = await next(e)
+    const id = (e as { session_id?: unknown }).session_id
+    if (e.agentId === undefined && !ran.isError && typeof id === 'string') await syncRemote($, [id])
+    return ran
+  })
+
   // Whatever arrives (a started session reporting back, the app's notice
   // that one ended its turn) is a good moment to look again rather than wait
   // for the next tick.
   on('session.receive', async ($, e, next) => {
     const received = await next(e)
-    if (e.agentId === undefined) void syncSessions($)
+    if (e.agentId === undefined) {
+      void syncSessions($)
+      void syncRemote($)
+    }
     return received
   })
 
@@ -377,7 +436,8 @@ export const register: Register = on => {
       ((e.props.isWorking || bg.isTurnRunning === true) && !isAsking) ||
       bg.agents.length > 0 ||
       bg.shells.length > 0 ||
-      (bg.sessions ?? []).length > 0
+      (bg.sessions ?? []).length > 0 ||
+      (bg.remote ?? []).length > 0
 
     const name = await currentTheme($)
 

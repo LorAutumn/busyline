@@ -12,6 +12,8 @@ export type Shell = { id: string; output?: string; lastActiveMs: number }
 // running; `watchSessions` says whether to keep asking the app about them
 // (absent until the first look at session start); `watchUntilMs`, until
 // when it holds on an empty answer after a start or a message.
+// `remoteIds` holds the cloud sessions started through Claude Code Remote
+// that are still asked about; `remote`, those of them working now.
 export type Background = {
   agents: string[]
   shells: Shell[]
@@ -21,6 +23,8 @@ export type Background = {
   startedIds?: string[]
   watchSessions?: boolean
   watchUntilMs?: number
+  remoteIds?: string[]
+  remote?: string[]
 }
 
 declare module 'claude-code' {
