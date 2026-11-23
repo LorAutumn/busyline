@@ -10,7 +10,8 @@ export type Shell = { id: string; output?: string; lastActiveMs: number }
 // `startedIds` holds the ids start_session answered with.
 // `sessions` holds the sessions this one started in the desktop app that are
 // running; `watchSessions` says whether to keep asking the app about them
-// (absent until the first look at session start).
+// (absent until the first look at session start); `watchUntilMs`, until
+// when it holds on an empty answer after a start or a message.
 export type Background = {
   agents: string[]
   shells: Shell[]
@@ -19,6 +20,7 @@ export type Background = {
   sessions?: string[]
   startedIds?: string[]
   watchSessions?: boolean
+  watchUntilMs?: number
 }
 
 declare module 'claude-code' {

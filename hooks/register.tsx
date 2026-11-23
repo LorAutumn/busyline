@@ -44,47 +44,83 @@ async function liveness($: EngineInterface, output: string): Promise<Liveness> {
 
 let isSyncingShells = false
 let isSyncingSessions = false
+// A check asked for while one runs: it runs again right after.
+let isSyncAgain = false
 // The app may be out of reach for a moment (a reconnect): the watch ends
 // only after this many checks in a row got no answer.
 const MAX_UNANSWERED = 6
 let unanswered = 0
+// After a start or a message, a session may take a moment to read as
+// running: the watch holds this long before it ends on an empty answer. A
+// suggestion card may be started by the person much later.
+const START_GRACE_MS = 60_000
+const CARD_GRACE_MS = 15 * 60 * 1000
+
+// Ends the watch, unless a start or a message (re)opened it meanwhile: its
+// grace runs past `now`.
+async function endWatch($: EngineInterface, now: number): Promise<void> {
+  await update($, background, b =>
+    now < (b.watchUntilMs ?? 0)
+      ? b
+      : { ...b, watchSessions: false, sessions: [], watchUntilMs: undefined },
+  )
+}
 
 // Sessions this one started in the desktop app (start_session) that are
-// still running. Asked about only once this session started one, or found
-// one at its start (`isFirstLook`: none found, it stops asking).
+// still running. Asked about only while the watch is on: from a start, a
+// message to a session, or the first look at the session's start
+// (`isFirstLook`), until nothing started runs and the grace has passed.
 async function syncSessions($: EngineInterface, isFirstLook = false): Promise<void> {
-  if (isSyncingSessions) return
+  if (isSyncingSessions) {
+    isSyncAgain = true
+    return
+  }
   isSyncingSessions = true
   try {
-    const current = await read($, background)
-    if (current.watchSessions !== true) return
-    const started = await startedSessions($, current.startedIds ?? [])
-    if (started === undefined) {
-      // No answer: keep what is known, and give up only when it lasts (or at
-      // once on the first look, where there may be no app at all).
-      unanswered += 1
-      if (isFirstLook || unanswered >= MAX_UNANSWERED) {
-        await update($, background, b => ({ ...b, watchSessions: false, sessions: [] }))
-      }
-      return
-    }
-    unanswered = 0
-    if (isFirstLook && started.listed.length === 0) {
-      // Nothing was started: stop asking until the next start_session.
-      await update($, background, b => ({ ...b, watchSessions: false, sessions: [] }))
-      return
-    }
-    const { running } = started
-    const known = current.sessions ?? []
-    const same = running.length === known.length && running.every(id => known.includes(id))
-    if (!same) await update($, background, b => ({ ...b, sessions: running }))
+    do {
+      isSyncAgain = false
+      await checkSessions($, isFirstLook)
+    } while (isSyncAgain)
   } finally {
     isSyncingSessions = false
   }
 }
 
-async function watchSessions($: EngineInterface, isFirstLook = false): Promise<void> {
-  await update($, background, b => (b.watchSessions === true ? b : { ...b, watchSessions: true }))
+async function checkSessions($: EngineInterface, isFirstLook: boolean): Promise<void> {
+  const current = await read($, background)
+  if (current.watchSessions !== true) return
+  const started = await startedSessions($, current.startedIds ?? [])
+  if (started === undefined || !started.isComplete) {
+    // No answer: keep what is known, and give up only when it lasts (or at
+    // once on the first look, where there may be no app at all).
+    unanswered += 1
+    if ((isFirstLook && started === undefined) || unanswered >= MAX_UNANSWERED) {
+      await endWatch($, await $.clock.now())
+    }
+    return
+  }
+  unanswered = 0
+  const { running, waiting } = started
+  const now = await $.clock.now()
+  if (running.length + waiting.length === 0 && now >= (current.watchUntilMs ?? 0)) {
+    // Nothing started runs or waits for the person: stop asking until the
+    // next start or message.
+    await endWatch($, now)
+    return
+  }
+  const known = current.sessions ?? []
+  const same = running.length === known.length && running.every(id => known.includes(id))
+  if (!same) await update($, background, b => ({ ...b, sessions: running }))
+}
+
+async function watchSessions($: EngineInterface, graceMs: number, isFirstLook = false): Promise<void> {
+  unanswered = 0
+  const until = (await $.clock.now()) + graceMs
+  await update($, background, b => ({
+    ...b,
+    watchSessions: true,
+    watchUntilMs: Math.max(b.watchUntilMs ?? 0, until),
+  }))
   await syncSessions($, isFirstLook)
 }
 
@@ -169,7 +205,8 @@ export const register: Register = on => {
       immediate: true,
     })
 
-    // A turn that was running when the session (or the mod) stopped is over.
+    // A turn that was running when the session stopped is over. A reload
+    // of the mod mid-turn clears it too: the band's own prop still shows it.
     await update($, background, b => (b.isTurnRunning ? { ...b, isTurnRunning: false } : b))
 
     // An early version kept a debug trace of prompt snippets here.
@@ -182,10 +219,14 @@ export const register: Register = on => {
       await syncAgents($)
       await syncShells($)
     })
+
+    // Timers outlive a dispatch only when started here. While the watch is
+    // off a tick reads the state and returns.
     $.clock.every(SESSIONS_MS, () => syncSessions($))
 
-    // A resumed conversation may have started sessions before: one look.
-    if ((await read($, background)).watchSessions === undefined) await watchSessions($, true)
+    // A resumed conversation may have started sessions before: one look,
+    // not awaited, so a slow app does not hold up the session's start.
+    if ((await read($, background)).watchSessions === undefined) void watchSessions($, 0, true)
 
     return next(e)
   })
@@ -276,7 +317,7 @@ export const register: Register = on => {
           startedIds: [...new Set([...(b.startedIds ?? []), ...ids])].slice(-MAX_CHECKED),
         }))
       }
-      await watchSessions($)
+      await watchSessions($, ids.length > 0 ? START_GRACE_MS : CARD_GRACE_MS)
     }
     return ran
   })
@@ -284,7 +325,7 @@ export const register: Register = on => {
   // A message to a started session sets it to work again.
   on('tool.call', { tool: 'mcp__ccd_session_mgmt__send_message' }, async ($, e, next) => {
     const ran = await next(e)
-    if (e.agentId === undefined && !ran.isError) await watchSessions($)
+    if (e.agentId === undefined && !ran.isError) await watchSessions($, START_GRACE_MS)
     return ran
   })
 

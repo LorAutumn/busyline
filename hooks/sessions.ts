@@ -7,9 +7,10 @@ const SERVER = 'ccd_session_mgmt'
 // No more ids from start_session answers than this are kept.
 export const MAX_CHECKED = 20
 
-// A session's id: `local_…` on the person's computer, `session_…` in the
-// cloud. start_session's answer also carries the word `session_id`.
-const SESSION_ID = /\b(?:local|session)_(?!id\b)[A-Za-z0-9][A-Za-z0-9_-]*/g
+// start_session's answer names the new session as `session_id: <id>`, the
+// id `local_…` on the person's computer, `session_…` in the cloud. Its title
+// comes earlier in the answer and may hold words like those.
+const SESSION_ID = /\bsession_id:\s*((?:local|session)_[A-Za-z0-9][A-Za-z0-9_-]*)/g
 
 type Result = { content: ReadonlyArray<{ type: string; text?: string }>; isError?: boolean }
 
@@ -27,7 +28,7 @@ function textOf(result: Result): string {
 }
 
 export function sessionIds(text: string): string[] {
-  return [...new Set(text.match(SESSION_ID) ?? [])]
+  return [...new Set([...text.matchAll(SESSION_ID)].map(m => m[1] ?? ''))].filter(Boolean)
 }
 
 function parse(text: string): unknown {
@@ -57,27 +58,31 @@ async function appSelf($: EngineInterface): Promise<string | undefined> {
 }
 
 // The app reads a session that waits for the person (a permission, a
-// question) as running; ListAgents tells them apart: `waiting`, by title.
-// Empty when ListAgents cannot be asked.
-async function waitingTitles($: EngineInterface): Promise<Set<string>> {
-  const waiting = new Set<string>()
+// question) as running; ListAgents tells them apart, by title: each title's
+// statuses. Empty when ListAgents cannot be asked.
+async function agentStatuses($: EngineInterface): Promise<Map<string, string[]>> {
+  const statuses = new Map<string, string[]>()
   try {
     const ran = await $.tool.call({ tool: 'ListAgents' })
     const sections = (ran.result as { sections?: unknown } | undefined)?.sections
-    if (!Array.isArray(sections)) return waiting
+    if (!Array.isArray(sections)) return statuses
     for (const section of sections as { rows?: unknown }[]) {
       if (!Array.isArray(section.rows)) continue
       for (const row of section.rows as { name?: unknown; status?: unknown }[]) {
-        if (typeof row.name === 'string' && row.status === 'waiting') waiting.add(row.name)
+        if (typeof row.name !== 'string' || typeof row.status !== 'string') continue
+        statuses.set(row.name, [...(statuses.get(row.name) ?? []), row.status])
       }
     }
   } catch {
     // No ListAgents here: the app's word stands.
   }
-  return waiting
+  return statuses
 }
 
-export type Started = { listed: string[]; running: string[] }
+// `isComplete` is false when this session's own id could not be learnt:
+// its children cannot be told from the rest yet.
+// `waiting` are children that wait for the person: no work, but still watched.
+export type Started = { listed: string[]; running: string[]; waiting: string[]; isComplete: boolean }
 
 // The sessions this one started, and which of them run now; undefined when
 // the app cannot be asked (another surface, or the server is not connected).
@@ -98,12 +103,13 @@ export async function startedSessions(
   } catch {
     return undefined
   }
-  if (rows.length === 0 && known.length === 0) return { listed: [], running: [] }
+  if (rows.length === 0 && known.length === 0) return { listed: [], running: [], waiting: [], isComplete: true }
 
   const self = await appSelf($)
+  if (self === undefined) return { listed: [], running: [], waiting: [], isComplete: false }
   const children = rows.filter(
     (row): row is Row & { sessionId: string } =>
-      typeof row.sessionId === 'string' && self !== undefined && row.startedBy === self,
+      typeof row.sessionId === 'string' && row.sessionId !== self && row.startedBy === self,
   )
   const listed = new Set(children.map(row => row.sessionId))
   const working: Row[] = children.filter(isWorking)
@@ -121,9 +127,14 @@ export async function startedSessions(
     }
   }
 
-  const waiting = working.length > 0 ? await waitingTitles($) : new Set<string>()
-  const running = working
-    .filter(row => !(typeof row.title === 'string' && waiting.has(row.title)))
-    .map(row => row.sessionId as string)
-  return { listed: [...listed], running }
+  // A child waits for the person only when every session of its title does:
+  // a busy namesake keeps it counted as work.
+  const statuses = working.length > 0 ? await agentStatuses($) : new Map<string, string[]>()
+  const isWaiting = (row: Row) => {
+    const seen = typeof row.title === 'string' ? statuses.get(row.title) : undefined
+    return seen !== undefined && seen.length > 0 && seen.every(status => status === 'waiting')
+  }
+  const running = working.filter(row => !isWaiting(row)).map(row => row.sessionId as string)
+  const waiting = working.filter(isWaiting).map(row => row.sessionId as string)
+  return { listed: [...listed], running, waiting, isComplete: true }
 }

@@ -42,7 +42,7 @@ const startedText = (id: string) =>
 // started, their siblings), each child naming its starter in `startedBy`.
 function app(
   on: On,
-  world: { rows: Row[]; isDown?: boolean; statuses?: Record<string, string> },
+  world: { rows: Row[]; isDown?: boolean; selfFails?: number; statuses?: Record<string, string> },
   calls: string[] = [],
   asked: unknown[] = [],
 ) {
@@ -64,6 +64,10 @@ function app(
     if (e.tool === 'get_session') {
       asked.push(e.args.session_id)
       const id = String(e.args.session_id)
+      if (id === 'self' && (world.selfFails ?? 0) > 0) {
+        world.selfFails = (world.selfFails ?? 0) - 1
+        return { value: { content: [{ type: 'text', text: 'busy' }], isError: true } }
+      }
       const found = row(id === 'self' ? SELF : id)
       if (found === undefined) return { value: { content: [{ type: 'text', text: 'not found' }], isError: true } }
       return text(JSON.stringify({ isArchived: false, ...found }, null, 2))
@@ -163,8 +167,7 @@ test('other sessions of the person do not move the train', async ($, on) => {
   expect(await moving($)).toBe(false)
 })
 
-test('the main session never counts as its own child', async ($, on) => {
-  // The mod's own list names the main session, running while its turn does.
+test('a finished child does not count', async ($, on) => {
   app(on, { rows: [{ sessionId: 'local_child-0003', isRunning: false, startedBy: SELF }] })
   starts(on, 'local_child-0003')
   const clock = await start($, on)
@@ -184,9 +187,11 @@ test('the word session_id in the answer is no session', async ($, on) => {
 })
 
 test('a started session is asked about however many sessions the person has', async ($, on) => {
+  // Siblings started by the same parent fill the family list.
   const rows: Row[] = Array.from({ length: 40 }, (_, i) => ({
-    sessionId: `local_other-${String(i).padStart(4, '0')}`,
+    sessionId: `local_sibling-${String(i).padStart(4, '0')}`,
     isRunning: false,
+    startedBy: 'local_parent-0001',
   }))
   const world = { rows }
   app(on, world)
@@ -316,5 +321,127 @@ test('without ListAgents a running started session moves the train', async ($, o
   app(on, { rows: [{ sessionId: 'local_child-0009', title: 'T', isRunning: true, startedBy: SELF }] })
   on('tool.call', { tool: 'ListAgents' }, () => ({ deny: 'not here' }))
   await start($, on)
+  expect(await moving($)).toBe(true)
+})
+
+test('the main session in the list never counts as its own child', async ($, on) => {
+  // A session started by another sees itself in its family list.
+  app(on, { rows: [{ sessionId: SELF, isRunning: true, startedBy: SELF }] })
+  const clock = await start($, on)
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(false)
+})
+
+test('the watch ends once the started sessions are done', async ($, on) => {
+  const calls: string[] = []
+  const world = { rows: [] as Row[] }
+  app(on, world, calls)
+  starts(on, 'local_child-0010')
+  const clock = await start($, on)
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  world.rows.push({ sessionId: 'local_child-0010', isRunning: true, startedBy: SELF })
+  await clock.advance(30_000)
+  expect(await moving($)).toBe(true)
+
+  world.rows[0] = { ...world.rows[0]!, isRunning: false }
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(false)
+  // Past the grace after the start, the watch ends.
+  await clock.advance(60_000)
+  const before = calls.filter(c => c === 'list_sessions').length
+  await clock.advance(10 * 60_000)
+  expect(calls.filter(c => c === 'list_sessions').length).toBe(before)
+})
+
+test('a fresh start is watched a while before it reads as running', async ($, on) => {
+  const world = { rows: [] as Row[] }
+  app(on, world)
+  starts(on, 'local_child-0011')
+  const clock = await start($, on)
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  await clock.advance(20_000)
+  world.rows.push({ sessionId: 'local_child-0011', isRunning: true, startedBy: SELF })
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(true)
+})
+
+test('a message to a session this one did not start costs only a short look', async ($, on) => {
+  const calls: string[] = []
+  app(on, { rows: [{ sessionId: 'local_other-0001', isRunning: true }] }, calls)
+  on('tool.call', { tool: 'mcp__ccd_session_mgmt__send_message' }, () => ({ result: 'sent' }))
+  const clock = await start($, on)
+  await $.tool.call({ tool: 'mcp__ccd_session_mgmt__send_message', session_id: 'local_other-0001', message: 'hi' })
+  await clock.advance(2 * 60_000)
+  const before = calls.filter(c => c === 'list_sessions').length
+  await clock.advance(10 * 60_000)
+  expect(calls.filter(c => c === 'list_sessions').length).toBe(before)
+  expect(await moving($)).toBe(false)
+})
+
+test('a long outage ends the watch, and the next start watches afresh', async ($, on) => {
+  const world = { rows: [] as Row[], isDown: true }
+  app(on, world)
+  starts(on, 'local_child-0012')
+  const clock = await start($, on)
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  await clock.advance(70_000) // six checks without an answer
+
+  // The next start: one missed check does not end it.
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  await clock.advance(10_000)
+  world.isDown = false
+  world.rows.push({ sessionId: 'local_child-0012', isRunning: true, startedBy: SELF })
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(true)
+})
+
+test('a title in the answer that looks like an id is not asked about', async ($, on) => {
+  const asked: unknown[] = []
+  app(on, { rows: [] }, [], asked)
+  on('tool.call', { tool: 'mcp__ccd_session__start_session' }, () => ({
+    result: 'Started session "Fix session_manager in local_dev" (session_id: local_child-0013, name: x).',
+  }))
+  await start($, on)
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  expect(asked).toContain('local_child-0013')
+  expect(asked).not.toContain('session_manager')
+  expect(asked).not.toContain('local_dev')
+})
+
+test('a busy child keeps the train rolling beside a waiting one of the same title', async ($, on) => {
+  const world = {
+    rows: [
+      { sessionId: 'local_child-0014', title: 'Tests', isRunning: true, startedBy: SELF },
+      { sessionId: 'local_child-0015', title: 'Tests', isRunning: true, startedBy: SELF },
+    ] as Row[],
+    statuses: {} as Record<string, string>,
+  }
+  app(on, world)
+  on('tool.call', { tool: 'ListAgents' }, () => ({
+    result: {
+      listing: '',
+      sections: [
+        {
+          kind: 'sessions',
+          total: 2,
+          rows: [
+            { name: 'Tests', ref: 'a1', type: 'interactive', status: 'waiting' },
+            { name: 'Tests', ref: 'a2', type: 'interactive', status: 'busy' },
+          ],
+        },
+      ],
+    },
+  }))
+  await start($, on)
+  expect(await moving($)).toBe(true)
+})
+
+test('a child is still found when this session\'s own id is slow to come', async ($, on) => {
+  app(on, {
+    rows: [{ sessionId: 'local_child-0016', isRunning: true, startedBy: SELF }],
+    selfFails: 1, // the first look cannot learn this session's id
+  })
+  const clock = await start($, on)
+  await clock.advance(10_000)
   expect(await moving($)).toBe(true)
 })
