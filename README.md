@@ -4,11 +4,40 @@ A small train above the Claude Code prompt that rolls while Claude works and
 stands still while it waits for you.
 
 It counts as work: the main turn, subagents still running, shells sent to
-the background, until they finish or go quiet, and, in the desktop app,
-sessions this one started that are still running. While a question or a plan
-waits for your answer, the train stops. It is drawn as block characters in
+the background, until they finish or go quiet, and sessions this one
+started that are still working. While a question or a plan waits for your
+answer, the train stops. It is drawn as block characters in
 the terminal and as an animated SVG in the desktop app, in muted colours so it
 sits on the screen like a watermark.
+
+## Sessions started from this one
+
+The train keeps rolling after the main turn has ended while a session this
+one started is still working, and stands while that session waits for you.
+
+- **Desktop app.** After a `start_session` or a message to a session, the mod
+  asks the app every 10 seconds which of the sessions this one started are
+  running. Only those count: your other sessions, the one that started this
+  one and its siblings do not. A session waiting for a permission or an
+  answer does not count either. The asking ends once nothing started runs
+  and begins again with the next start or message, so a conversation that
+  starts no sessions costs one look at its start.
+- **Cloud sessions.** Sessions started through Claude Code Remote
+  (`create_session`, or written to with `send_message`) are asked about every
+  10 seconds until they complete or fail. `working` counts as work, `blocked`
+  does not. This part is built from the described answers of that server and
+  tested against a stand-in only; it has not been checked in a cloud session.
+
+Things to know:
+
+- The train may take up to 10 seconds to notice that a session started or
+  finished working.
+- Sessions a subagent starts are not followed.
+- Whether a desktop session waits for you is read from the agent list, which
+  names sessions by title. Two started sessions with the same title count as
+  work as long as one of them is busy.
+- While a permission dialog of the main session is open, the train keeps
+  rolling: nothing tells a mod when the dialog is answered.
 
 ## Install
 
