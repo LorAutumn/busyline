@@ -155,3 +155,35 @@ test('a moment without the app does not end the watch', async ($, on) => {
   await clock.advance(10_000)
   expect(await moving($)).toBe(false)
 })
+
+test('a local session is known by the id start_session answers with', async ($, on) => {
+  // The list never names it: the id from the start is asked about anyway.
+  const sessions = { started: [] as string[], running: new Set(['local_ab12-cd34']) }
+  on('session.id', () => ({ value: 'session_main' }))
+  on('mcp.call', (_, e) => {
+    if (e.tool === 'list_sessions') return text('No other sessions found.')
+    const id = String(e.args.session_id)
+    return text(JSON.stringify({ sessionId: id, isRunning: sessions.running.has(id) }))
+  })
+  on('tool.call', { tool: 'mcp__ccd_session__start_session' }, () => ({
+    result: 'Started. session_id: local_ab12-cd34',
+  }))
+  on('tool.call', { tool: 'mcp__ccd_session_mgmt__send_message' }, () => ({ result: 'sent' }))
+  const clock = await start($, on)
+
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  expect(await moving($)).toBe(true)
+
+  sessions.running.clear()
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(false)
+
+  // A follow-up message sets it to work again.
+  sessions.running.add('local_ab12-cd34')
+  await $.tool.call({
+    tool: 'mcp__ccd_session_mgmt__send_message',
+    session_id: 'local_ab12-cd34',
+    message: 'weiter',
+  })
+  expect(await moving($)).toBe(true)
+})

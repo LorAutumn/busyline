@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import { startedSessions } from './sessions'
+import { MAX_CHECKED, sessionIds, startedSessions } from './sessions'
 import { DEFAULT_THEME, THEMES, themeOf } from './themes'
 import type { Background, Shell } from '../types'
 
@@ -58,7 +58,7 @@ async function syncSessions($: EngineInterface, isFirstLook = false): Promise<vo
   try {
     const current = await read($, background)
     if (current.watchSessions !== true) return
-    const started = await startedSessions($)
+    const started = await startedSessions($, current.startedIds ?? [])
     if (started === undefined) {
       // No answer: keep what is known, and give up only when it lasts (or at
       // once on the first look, where there may be no app at all).
@@ -266,17 +266,34 @@ export const register: Register = on => {
   // start it later, so the watch begins either way.
   on('tool.call', { tool: 'mcp__ccd_session__start_session' }, async ($, e, next) => {
     const ran = await next(e)
+    if (e.agentId === undefined && !ran.isError) {
+      // Started at once, the answer names the new session; a card names none.
+      const answer = ran.text ?? (typeof ran.result === 'string' ? ran.result : JSON.stringify(ran.result ?? ''))
+      const ids = sessionIds(answer)
+      if (ids.length > 0) {
+        await update($, background, b => ({
+          ...b,
+          startedIds: [...new Set([...(b.startedIds ?? []), ...ids])].slice(-MAX_CHECKED),
+        }))
+      }
+      await watchSessions($)
+    }
+    return ran
+  })
+
+  // A message to a started session sets it to work again.
+  on('tool.call', { tool: 'mcp__ccd_session_mgmt__send_message' }, async ($, e, next) => {
+    const ran = await next(e)
     if (e.agentId === undefined && !ran.isError) await watchSessions($)
     return ran
   })
 
-  // Another session's message (a started one reporting back) is a good
-  // moment to look again rather than wait for the next tick.
+  // Whatever arrives (a started session reporting back, the app's notice
+  // that one ended its turn) is a good moment to look again rather than wait
+  // for the next tick.
   on('session.receive', async ($, e, next) => {
     const received = await next(e)
-    if (e.agentId === undefined && (e.origin.kind === 'peer' || e.origin.kind === 'peer-send-message')) {
-      void syncSessions($)
-    }
+    if (e.agentId === undefined) void syncSessions($)
     return received
   })
 

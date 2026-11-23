@@ -1,15 +1,14 @@
 import type { EngineInterface } from 'claude-code'
 
-// The desktop app's session tools: start_session starts another session,
-// and the management server lists the sessions this one started and tells
-// whether each is running.
-
+// The desktop app's session manager: it lists the sessions this one started
+// with start_session and tells whether each is running.
 const SERVER = 'ccd_session_mgmt'
 
 // No more sessions than this are asked about in one check.
-const MAX_CHECKED = 20
+export const MAX_CHECKED = 20
 
-const SESSION_ID = /session_[A-Za-z0-9]+/g
+// A session's id: `local_…` on the person's computer, `session_…` in the cloud.
+const SESSION_ID = /\b(?:local|session)_[A-Za-z0-9][A-Za-z0-9_-]*/g
 
 function textOf(result: { content: ReadonlyArray<{ type: string; text?: string }> }): string {
   return result.content.map(block => (block.type === 'text' ? (block.text ?? '') : '')).join('\n')
@@ -23,7 +22,12 @@ export type Started = { listed: string[]; running: string[] }
 
 // The sessions this one started, and which of them run now; undefined when
 // the app cannot be asked (another surface, or the server is not connected).
-export async function startedSessions($: EngineInterface): Promise<Started | undefined> {
+// `known` are ids start_session answered with: asked about even when the
+// list leaves them out.
+export async function startedSessions(
+  $: EngineInterface,
+  known: readonly string[] = [],
+): Promise<Started | undefined> {
   let listed: string
   try {
     const result = await $.mcp.call(SERVER, 'list_sessions', {})
@@ -34,9 +38,9 @@ export async function startedSessions($: EngineInterface): Promise<Started | und
   }
 
   const self = await $.session.id()
-  const ids = sessionIds(listed)
+  const ids = [...new Set([...known, ...sessionIds(listed)])]
     .filter(id => id !== self)
-    .slice(0, MAX_CHECKED)
+    .slice(-MAX_CHECKED)
 
   const running: string[] = []
   for (const id of ids) {
