@@ -192,30 +192,6 @@ async function whileAsking<T>(
   }
 }
 
-// Permission dialogs of the main loop that are over: `ids` the calls they
-// asked about. A subagent's (`agentId`) the main train does not wait on.
-async function endDialogs(
-  $: EngineInterface,
-  agentId: string | undefined,
-  ids: readonly string[],
-): Promise<void> {
-  if (agentId !== undefined || ids.length === 0) return
-  if ((await read($, background)).dialogs?.some(id => ids.includes(id))) {
-    await update($, background, b => ({ ...b, dialogs: (b.dialogs ?? []).filter(id => !ids.includes(id)) }))
-  }
-}
-
-// The calls a result row answers: its tool_result blocks' `tool_use_id`.
-function answeredIds(content: readonly unknown[]): string[] {
-  return content.flatMap(block => {
-    const b = block as { type?: unknown; tool_use_id?: unknown }
-    return b.type === 'tool_result' && typeof b.tool_use_id === 'string' ? [b.tool_use_id] : []
-  })
-}
-
-// Tools whose call is itself a question to the person: `whileAsking` covers them.
-const PERSON_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
-
 function dropShells(b: Background, ids: readonly string[]): Background {
   return { ...b, shells: b.shells.filter(s => !ids.includes(s.id)) }
 }
@@ -231,9 +207,7 @@ export const register: Register = on => {
 
     // A turn that was running when the session stopped is over. A reload
     // of the mod mid-turn clears it too: the band's own prop still shows it.
-    await update($, background, b =>
-      b.isTurnRunning || (b.dialogs ?? []).length > 0 ? { ...b, isTurnRunning: false, dialogs: [] } : b,
-    )
+    await update($, background, b => (b.isTurnRunning ? { ...b, isTurnRunning: false } : b))
 
     // An early version kept a debug trace of prompt snippets here.
     await $.store.delete('debug')
@@ -300,7 +274,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
-      await update($, background, b => ({ ...b, isTurnRunning: false, dialogs: [] }))
+      await update($, background, b => ({ ...b, isTurnRunning: false }))
     } else {
       await syncAgents($)
     }
@@ -383,44 +357,6 @@ export const register: Register = on => {
     whileAsking($, e.agentId === undefined ? e.tool_use_id : undefined, () => next(e)),
   )
 
-  // A permission dialog of the main loop waits for the person: no work. The
-  // check that puts a call to a person opens it (classic hooks may not reach
-  // a mod: a security plugin can take them first). Nothing marks the person's
-  // answer, so the wait ends at the call's result row (allowed and run, or
-  // refused), at auto mode's classifier settling the question, or at the
-  // turn's end. An allowed call thus reads as waiting until it has run, and
-  // so does one a hook above this one or a PermissionRequest hook allows
-  // without a dialog.
-  on('tool.check', async ($, e, next) => {
-    const verdict = await next(e)
-    if (
-      e.agentId === undefined &&
-      e.tool_use_id !== undefined &&
-      next.origin.plugin === 'engine' && // the model's own call, not a mod's
-      e.approver === 'person' &&
-      verdict.decision === 'ask' &&
-      !PERSON_TOOLS.has(e.tool) // whileAsking holds these
-    ) {
-      const id = e.tool_use_id
-      await update($, background, b => ({ ...b, dialogs: [...(b.dialogs ?? []), id] }))
-    }
-    return verdict
-  })
-  // The classifier's `ask` (it gave no verdict) leaves the question to the
-  // person's dialog.
-  on('tool.judge', async ($, e, next) => {
-    const verdict = await next(e)
-    if (verdict.decision !== 'ask' && e.tool_use_id !== undefined) {
-      await endDialogs($, e.agentId, [e.tool_use_id])
-    }
-    return verdict
-  })
-  on('session.append', { door: 'tool-result' }, async ($, e, next) => {
-    const kept = await next(e)
-    await endDialogs($, e.agentId, answeredIds(e.message.content))
-    return kept
-  })
-
   // The notice arrives as a prompt of its own (not flagged meta), its text
   // naming the task; one notice may name several.
   on('prompt.submit', async ($, e, next) => {
@@ -436,7 +372,7 @@ export const register: Register = on => {
     if ((await $.store.get(ENABLED)) === false) return next(e)
 
     const bg = { ...IDLE, ...(await read($, background)) }
-    const isAsking = (bg.asking ?? []).length > 0 || (bg.dialogs ?? []).length > 0
+    const isAsking = (bg.asking ?? []).length > 0
     const isWorking =
       ((e.props.isWorking || bg.isTurnRunning === true) && !isAsking) ||
       bg.agents.length > 0 ||
