@@ -156,6 +156,9 @@ export const register: Register = on => {
       immediate: true,
     })
 
+    // A turn that was running when the session (or the mod) stopped is over.
+    await update($, background, b => (b.isTurnRunning ? { ...b, isTurnRunning: false } : b))
+
     // An early version kept a debug trace of prompt snippets here.
     await $.store.delete('debug')
 
@@ -199,11 +202,13 @@ export const register: Register = on => {
     return { text: isOn ? 'The train is rolling again.' : 'The train is back in the depot.' }
   })
 
-  // The band's own `isWorking` prop follows the main turn. Subagents are
-  // tracked by their own turns, background shells from launch to notice.
+  // The main turn is tracked here too: the band's `isWorking` prop can still
+  // read false when the turn's start redraws it, and nothing redraws the band
+  // when the prop turns true. Subagents are tracked by their own turns,
+  // background shells from launch to notice.
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
-      $.ui.invalidate('ui.render')
+      await update($, background, b => ({ ...b, isTurnRunning: true }))
     } else {
       const id = e.agentId
       await update($, background, b =>
@@ -215,7 +220,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
-      $.ui.invalidate('ui.render')
+      await update($, background, b => ({ ...b, isTurnRunning: false }))
     } else {
       await syncAgents($)
     }
@@ -298,7 +303,7 @@ export const register: Register = on => {
     const bg = { ...IDLE, ...(await read($, background)) }
     const isAsking = (bg.asking ?? []).length > 0
     const isWorking =
-      (e.props.isWorking && !isAsking) ||
+      ((e.props.isWorking || bg.isTurnRunning === true) && !isAsking) ||
       bg.agents.length > 0 ||
       bg.shells.length > 0 ||
       (bg.sessions ?? []).length > 0

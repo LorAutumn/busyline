@@ -114,3 +114,18 @@ test('a suggestion card started later is picked up', async ($, on) => {
   await clock.advance(10_000)
   expect(await moving($)).toBe(true)
 })
+
+test('the train rolls from the main turn\'s start even while the prop still reads idle', async ($, on) => {
+  app(on, { started: [], running: new Set() })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  await start($, on)
+  expect(await moving($)).toBe(false)
+
+  // BAND's `isWorking` stays false: the prop as the turn's start reads it.
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  expect(await moving($)).toBe(true)
+
+  await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(await moving($)).toBe(false)
+})
