@@ -3,8 +3,9 @@
 A small train above the Claude Code prompt that rolls while Claude works and
 stands still while it waits for you.
 
-It counts as work: the main turn, subagents still running, and shells sent to
-the background, until they finish or go quiet. While a question or a plan
+It counts as work: the main turn, subagents still running, shells sent to
+the background, until they finish or go quiet, and, in the desktop app,
+sessions this one started that are still running. While a question or a plan
 waits for your answer, the train stops. It is drawn as block characters in
 the terminal and as an animated SVG in the desktop app, in muted colours so it
 sits on the screen like a watermark.

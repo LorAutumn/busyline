@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
+import { startedSessions } from './sessions'
 import { DEFAULT_THEME, THEMES, themeOf } from './themes'
 import type { Background, Shell } from '../types'
 
@@ -16,6 +17,9 @@ async function currentTheme($: EngineInterface): Promise<string> {
 }
 
 const RECONCILE_MS = 3000
+// Sessions this one started are asked about less often: each check is a
+// call to the desktop app per session.
+const SESSIONS_MS = 10_000
 // A shell whose output has not grown for this long is asked whether it is
 // still alive; one that cannot be asked is given up after the hard limit.
 const SHELL_SILENCE_MS = 2 * 60 * 1000
@@ -39,6 +43,37 @@ async function liveness($: EngineInterface, output: string): Promise<Liveness> {
 }
 
 let isSyncingShells = false
+let isSyncingSessions = false
+
+// Sessions this one started in the desktop app (start_session) that are
+// still running. Asked about only once this session started one, or found
+// one at its start (`isFirstLook`: none found, it stops asking).
+async function syncSessions($: EngineInterface, isFirstLook = false): Promise<void> {
+  if (isSyncingSessions) return
+  isSyncingSessions = true
+  try {
+    const current = await read($, background)
+    if (current.watchSessions !== true) return
+    const started = await startedSessions($)
+    if (started === undefined || (isFirstLook && started.listed.length === 0)) {
+      // The app cannot be asked here, or nothing was started: stop asking
+      // until the next start_session.
+      await update($, background, b => ({ ...b, watchSessions: false, sessions: [] }))
+      return
+    }
+    const { running } = started
+    const known = current.sessions ?? []
+    const same = running.length === known.length && running.every(id => known.includes(id))
+    if (!same) await update($, background, b => ({ ...b, sessions: running }))
+  } finally {
+    isSyncingSessions = false
+  }
+}
+
+async function watchSessions($: EngineInterface, isFirstLook = false): Promise<void> {
+  await update($, background, b => (b.watchSessions === true ? b : { ...b, watchSessions: true }))
+  await syncSessions($, isFirstLook)
+}
 
 // Agents the engine still counts as busy: queued, in a turn, or waiting on
 // background work of their own.
@@ -131,6 +166,10 @@ export const register: Register = on => {
       await syncAgents($)
       await syncShells($)
     })
+    $.clock.every(SESSIONS_MS, () => syncSessions($))
+
+    // A resumed conversation may have started sessions before: one look.
+    if ((await read($, background)).watchSessions === undefined) await watchSessions($, true)
 
     return next(e)
   })
@@ -204,6 +243,25 @@ export const register: Register = on => {
     return ran
   })
 
+  // A session started from here works on its own; the main turn may end
+  // while it runs. A suggestion card starts nothing yet, but the person may
+  // start it later, so the watch begins either way.
+  on('tool.call', { tool: 'mcp__ccd_session__start_session' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && !ran.isError) await watchSessions($)
+    return ran
+  })
+
+  // Another session's message (a started one reporting back) is a good
+  // moment to look again rather than wait for the next tick.
+  on('session.receive', async ($, e, next) => {
+    const received = await next(e)
+    if (e.agentId === undefined && (e.origin.kind === 'peer' || e.origin.kind === 'peer-send-message')) {
+      void syncSessions($)
+    }
+    return received
+  })
+
   // A stopped shell sends no completion notice.
   on('tool.call', { tool: 'TaskStop' }, async ($, e, next) => {
     const ran = await next(e)
@@ -240,7 +298,10 @@ export const register: Register = on => {
     const bg = { ...IDLE, ...(await read($, background)) }
     const isAsking = (bg.asking ?? []).length > 0
     const isWorking =
-      (e.props.isWorking && !isAsking) || bg.agents.length > 0 || bg.shells.length > 0
+      (e.props.isWorking && !isAsking) ||
+      bg.agents.length > 0 ||
+      bg.shells.length > 0 ||
+      (bg.sessions ?? []).length > 0
 
     const name = await currentTheme($)
 
