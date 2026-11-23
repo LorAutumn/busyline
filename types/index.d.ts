@@ -6,7 +6,8 @@ export type Shell = { id: string; output?: string; lastActiveMs: number }
 // background shells from their launch until their completion notice, a
 // TaskStop, or a long silence in their output. `asking` holds the main
 // loop's tool calls that wait for the person (a question, a plan to approve).
-// `isTurnRunning` is true from the main turn's start to its end.
+// `isTurnRunning` is true from the main turn's start to its end;
+// `dialogs` the calls whose permission dialog in the main loop waits.
 // `startedIds` holds the ids start_session answered with.
 // `sessions` holds the sessions this one started in the desktop app that are
 // running; `watchSessions` says whether to keep asking the app about them
@@ -17,6 +18,7 @@ export type Background = {
   shells: Shell[]
   asking?: string[]
   isTurnRunning?: boolean
+  dialogs?: string[]
   sessions?: string[]
   startedIds?: string[]
   watchSessions?: boolean
