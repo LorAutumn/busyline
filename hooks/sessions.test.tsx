@@ -21,11 +21,17 @@ const text = (t: string) => ({ value: { content: [{ type: 'text', text: t }], is
 
 // Stands for the desktop app's session tools: `running` says which of the
 // started sessions run now; `started` which ones list_sessions names.
-function app(on: On, sessions: { started: string[]; running: Set<string> }, calls: string[] = []) {
+function app(
+  on: On,
+  sessions: { started: string[]; running: Set<string>; isDown?: boolean },
+  calls: string[] = [],
+) {
   on('session.id', () => ({ value: 'session_main' }))
   on('mcp.call', (_, e) => {
     calls.push(e.tool)
-    if (e.server !== 'ccd_session_mgmt') return { value: { content: [], isError: true } }
+    if (e.server !== 'ccd_session_mgmt' || sessions.isDown) {
+      return { value: { content: [], isError: true } }
+    }
     if (e.tool === 'list_sessions') {
       return text(
         sessions.started.length === 0
@@ -127,5 +133,25 @@ test('the train rolls from the main turn\'s start even while the prop still read
   expect(await moving($)).toBe(true)
 
   await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(await moving($)).toBe(false)
+})
+
+test('a moment without the app does not end the watch', async ($, on) => {
+  const sessions = {
+    started: ['session_child1'],
+    running: new Set(['session_child1']),
+    isDown: false,
+  }
+  app(on, sessions)
+  const clock = await start($, on)
+  expect(await moving($)).toBe(true)
+
+  sessions.isDown = true
+  await clock.advance(30_000)
+  expect(await moving($)).toBe(true)
+
+  sessions.isDown = false
+  sessions.running.clear()
+  await clock.advance(10_000)
   expect(await moving($)).toBe(false)
 })

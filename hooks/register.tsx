@@ -44,6 +44,10 @@ async function liveness($: EngineInterface, output: string): Promise<Liveness> {
 
 let isSyncingShells = false
 let isSyncingSessions = false
+// The app may be out of reach for a moment (a reconnect): the watch ends
+// only after this many checks in a row got no answer.
+const MAX_UNANSWERED = 6
+let unanswered = 0
 
 // Sessions this one started in the desktop app (start_session) that are
 // still running. Asked about only once this session started one, or found
@@ -55,9 +59,18 @@ async function syncSessions($: EngineInterface, isFirstLook = false): Promise<vo
     const current = await read($, background)
     if (current.watchSessions !== true) return
     const started = await startedSessions($)
-    if (started === undefined || (isFirstLook && started.listed.length === 0)) {
-      // The app cannot be asked here, or nothing was started: stop asking
-      // until the next start_session.
+    if (started === undefined) {
+      // No answer: keep what is known, and give up only when it lasts (or at
+      // once on the first look, where there may be no app at all).
+      unanswered += 1
+      if (isFirstLook || unanswered >= MAX_UNANSWERED) {
+        await update($, background, b => ({ ...b, watchSessions: false, sessions: [] }))
+      }
+      return
+    }
+    unanswered = 0
+    if (isFirstLook && started.listed.length === 0) {
+      // Nothing was started: stop asking until the next start_session.
       await update($, background, b => ({ ...b, watchSessions: false, sessions: [] }))
       return
     }
