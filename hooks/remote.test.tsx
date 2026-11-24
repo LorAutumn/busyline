@@ -17,12 +17,28 @@ const BAND = {
   },
 } as const
 
-const CHILD = 'session_01ChildAbCdEf'
+const CHILD = 'session_01ExampleChild0000000000'
+// This session, as its children name it in `parent_session_id`.
+const SELF = 'session_01ExampleParent000000000'
+
+// A session as create_session and get_session answer it (seen in a cloud
+// session; the fields the mod does not read are left out).
+const ccr = (id: string, bucket: string, parent: string | undefined = SELF) =>
+  JSON.stringify({
+    ccr: {
+      id,
+      title: 'busyline test: wait 30 s',
+      session_status: 'SESSION_STATUS_RUNNING',
+      origin: 'claude_code_mcp_seed',
+      ...(parent === undefined ? {} : { parent_session_id: parent }),
+      status_bucket: `SESSION_STATUS_BUCKET_${bucket.toUpperCase()}`,
+    },
+  })
 const CREATE = 'mcp__claude-code-remote__create_session'
 const SEND = 'mcp__claude-code-remote__send_message'
 
 // Stands for Claude Code Remote as a cloud session reaches it: get_session
-// answers a session's `status_bucket`. The desktop app's own session tools
+// answers a session's `status_bucket`, this session's own too. The desktop app's own session tools
 // are not there. `calls` are the sessions asked about.
 function remote(
   on: On,
@@ -38,7 +54,7 @@ function remote(
     if (e.tool !== 'get_session' || bucket === undefined) {
       return { value: { content: [{ type: 'text', text: 'not found' }], isError: true } }
     }
-    const text = JSON.stringify({ id, title: 'child', status_bucket: bucket }, null, 2)
+    const text = ccr(id, bucket, id === SELF ? undefined : SELF)
     return { value: { content: [{ type: 'text', text }], isError: false } }
   })
 }
@@ -67,7 +83,7 @@ async function moving($: Engine): Promise<boolean> {
 test('the train rolls while a cloud session it started works and stops when it completes', async ($, on) => {
   const world = { buckets: { [CHILD]: 'working' } as Record<string, string> }
   remote(on, world)
-  creates(on, { id: CHILD, title: 'child' })
+  creates(on, ccr(CHILD, 'working'))
   const clock = await start($, on)
   expect(await moving($)).toBe(false)
 
@@ -82,7 +98,7 @@ test('the train rolls while a cloud session it started works and stops when it c
 test('a blocked cloud session stands, and rolls again once it works', async ($, on) => {
   const world = { buckets: { [CHILD]: 'blocked' } as Record<string, string> }
   remote(on, world)
-  creates(on, { session: { session_id: CHILD } })
+  creates(on, { content: [{ type: 'text', text: ccr(CHILD, 'working') }] })
   const clock = await start($, on)
 
   await $.tool.call({ tool: CREATE, prompt: 'p' })
@@ -110,7 +126,7 @@ test('a finished cloud session is no longer asked about', async ($, on) => {
 test('a message sets a finished cloud session to work again', async ($, on) => {
   const world = { buckets: { [CHILD]: 'completed' } as Record<string, string> }
   remote(on, world)
-  creates(on, { id: CHILD })
+  creates(on, ccr(CHILD, 'working'))
   const clock = await start($, on)
   await $.tool.call({ tool: CREATE, prompt: 'p' })
   await clock.advance(10_000)
@@ -125,7 +141,7 @@ test('a short outage keeps the train rolling, a long one ends the asking', async
   const world = { buckets: { [CHILD]: 'working' } as Record<string, string>, isDown: false }
   const calls: string[] = []
   remote(on, world, calls)
-  creates(on, { id: CHILD })
+  creates(on, ccr(CHILD, 'working'))
   const clock = await start($, on)
   await $.tool.call({ tool: CREATE, prompt: 'p' })
 
@@ -158,4 +174,46 @@ test('an answer that names no session starts no asking', async ($, on) => {
   await $.tool.call({ tool: CREATE, prompt: 'p' })
   await clock.advance(30_000)
   expect(calls).toEqual([])
+})
+
+test('the session that started the child is not taken for a child', async ($, on) => {
+  // The answer names this session as the child's parent.
+  const world = { buckets: { [CHILD]: 'working', [SELF]: 'working' } as Record<string, string> }
+  const calls: string[] = []
+  remote(on, world, calls)
+  creates(on, ccr(CHILD, 'working'))
+  const clock = await start($, on)
+  await $.tool.call({ tool: CREATE, prompt: 'p' })
+  expect(calls).toEqual([CHILD])
+
+  world.buckets[CHILD] = 'completed'
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(false)
+})
+
+test('a watched session that turns out to be the parent is dropped', async ($, on) => {
+  const world = { buckets: { [CHILD]: 'completed', [SELF]: 'working' } as Record<string, string> }
+  const calls: string[] = []
+  remote(on, world, calls)
+  creates(on, ccr(CHILD, 'working'))
+  const clock = await start($, on)
+  await $.tool.call({ tool: CREATE, prompt: 'p' })
+  // A message to this session itself puts it on the list.
+  await $.tool.call({ tool: SEND, session_id: SELF, message: 'm' })
+  world.buckets[CHILD] = 'working'
+  await $.tool.call({ tool: SEND, session_id: CHILD, message: 'm' })
+  world.buckets[CHILD] = 'completed'
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(false)
+})
+
+test('an object that names no session of its own starts no asking', async ($, on) => {
+  const calls: string[] = []
+  remote(on, { buckets: { [SELF]: 'working' } }, calls)
+  creates(on, JSON.stringify({ ccr: { parent_session_id: SELF, status_bucket: 'SESSION_STATUS_BUCKET_WORKING' } }))
+  const clock = await start($, on)
+  await $.tool.call({ tool: CREATE, prompt: 'p' })
+  await clock.advance(30_000)
+  expect(calls).toEqual([])
+  expect(await moving($)).toBe(false)
 })

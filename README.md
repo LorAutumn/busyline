@@ -25,8 +25,9 @@ one started is still working, and stands while that session waits for you.
 - **Cloud sessions.** Sessions started through Claude Code Remote
   (`create_session`, or written to with `send_message`) are asked about every
   10 seconds until they complete or fail. `working` counts as work, `blocked`
-  does not. This part is built from the described answers of that server and
-  tested against a stand-in only; it has not been checked in a cloud session.
+  does not. The tests answer as that server did in a cloud session for a
+  working and a completed session; a blocked or failed one has not been seen
+  there yet.
 
 Things to know:
 
