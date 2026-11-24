@@ -1,6 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
+import { remoteIds, remoteSessions } from './remote'
+import { MAX_CHECKED, sessionIds, startedSessions } from './sessions'
 import { DEFAULT_THEME, THEMES, themeOf } from './themes'
 import type { Background, Shell } from '../types'
 
@@ -16,6 +18,9 @@ async function currentTheme($: EngineInterface): Promise<string> {
 }
 
 const RECONCILE_MS = 3000
+// Sessions this one started are asked about less often: each check is a
+// call to the desktop app per session.
+const SESSIONS_MS = 10_000
 // A shell whose output has not grown for this long is asked whether it is
 // still alive; one that cannot be asked is given up after the hard limit.
 const SHELL_SILENCE_MS = 2 * 60 * 1000
@@ -39,6 +44,179 @@ async function liveness($: EngineInterface, output: string): Promise<Liveness> {
 }
 
 let isSyncingShells = false
+let sessionsSync: Promise<void> | undefined
+// A check asked for while one runs: it runs again right after.
+let isSyncAgain = false
+// The app may be out of reach for a moment (a reconnect): the watch ends
+// only after this many checks in a row got no answer.
+const MAX_UNANSWERED = 6
+let unanswered = 0
+// After a start or a message, a session may take a moment to read as
+// running: the watch holds this long before it ends on an empty answer. A
+// suggestion card may be started by the person much later.
+const START_GRACE_MS = 60_000
+const CARD_GRACE_MS = 15 * 60 * 1000
+// A session just started counts as running at once, and for this long
+// while the app does not read it as running yet: the main turn may end
+// before it does.
+const STARTING_MS = 15_000
+
+// Ends the watch, unless a start or a message (re)opened it meanwhile: its
+// grace runs past `now`.
+async function endWatch($: EngineInterface, now: number): Promise<void> {
+  await update($, background, b =>
+    now < (b.watchUntilMs ?? 0)
+      ? b
+      : { ...b, watchSessions: false, sessions: [], watchUntilMs: undefined, startingUntilMs: undefined },
+  )
+}
+
+// Sessions this one started in the desktop app (start_session) that are
+// still running. Asked about only while the watch is on: from a start, a
+// message to a session, or the first look at the session's start
+// (`isFirstLook`), until nothing started runs and the grace has passed.
+// A caller that finds a check running waits for it and the one after.
+function syncSessions($: EngineInterface, isFirstLook = false): Promise<void> {
+  if (sessionsSync !== undefined) {
+    isSyncAgain = true
+    return sessionsSync
+  }
+  sessionsSync = runSessionsSync($, isFirstLook)
+  return sessionsSync
+}
+
+async function runSessionsSync($: EngineInterface, isFirstLook: boolean): Promise<void> {
+  try {
+    do {
+      isSyncAgain = false
+      await checkSessions($, isFirstLook)
+    } while (isSyncAgain)
+  } finally {
+    sessionsSync = undefined
+  }
+}
+
+async function checkSessions($: EngineInterface, isFirstLook: boolean): Promise<void> {
+  const current = await read($, background)
+  if (current.watchSessions !== true) return
+  const started = await startedSessions($, current.startedIds ?? [])
+  if (started === undefined || !started.isComplete) {
+    // No answer: keep what is known, and give up only when it lasts (or at
+    // once on the first look, where there may be no app at all).
+    unanswered += 1
+    if ((isFirstLook && started === undefined) || unanswered >= MAX_UNANSWERED) {
+      await endWatch($, await $.clock.now())
+    }
+    return
+  }
+  unanswered = 0
+  const { running, waiting } = started
+  const now = await $.clock.now()
+  if (running.length + waiting.length === 0 && now >= (current.watchUntilMs ?? 0)) {
+    // Nothing started runs or waits for the person: stop asking until the
+    // next start or message.
+    await endWatch($, now)
+    return
+  }
+  const known = current.sessions ?? []
+  // One just started that does not read as running yet is held a moment.
+  const starting =
+    now < (current.startingUntilMs ?? 0)
+      ? known.filter(id => !running.includes(id) && !waiting.includes(id))
+      : []
+  const found = [...running, ...starting]
+  const same = found.length === known.length && found.every(id => known.includes(id))
+  // Ones started while the app answered are kept.
+  if (!same) {
+    await update($, background, b => ({
+      ...b,
+      sessions: [...found, ...(b.sessions ?? []).filter(id => !known.includes(id) && !found.includes(id))],
+    }))
+  }
+}
+
+// Cloud sessions this one started through Claude Code Remote: asked about
+// one by one while any is watched. `added` are ones just started or
+// written to.
+let isSyncingRemote = false
+let remoteUnanswered = 0
+// A cloud session that waits (on an answer, an approval) may never get
+// one: after this long without working it is no longer asked about. A
+// message to it starts the asking again. Since when each one waits:
+const MAX_REMOTE_WAIT_MS = 6 * 60 * 60 * 1000
+const remoteWaitingSince = new Map<string, number>()
+async function syncRemote($: EngineInterface, added: readonly string[] = []): Promise<void> {
+  if (added.length > 0) {
+    remoteUnanswered = 0
+    for (const id of added) remoteWaitingSince.delete(id)
+    await update($, background, b => ({
+      ...b,
+      remoteIds: [...new Set([...(b.remoteIds ?? []), ...added])].slice(-MAX_CHECKED),
+    }))
+  }
+  if (isSyncingRemote) return
+  isSyncingRemote = true
+  try {
+    const ids = (await read($, background)).remoteIds ?? []
+    if (ids.length === 0) return
+    const remote = await remoteSessions($, ids)
+    if (remote === undefined) {
+      // No answer: keep what is known, and give up only when it lasts.
+      remoteUnanswered += 1
+      if (remoteUnanswered >= MAX_UNANSWERED) {
+        remoteWaitingSince.clear()
+        await update($, background, b => ({ ...b, remote: [], remoteIds: [] }))
+      }
+      return
+    }
+    remoteUnanswered = 0
+    const now = await $.clock.now()
+    for (const id of [...remoteWaitingSince.keys()]) {
+      if (!remote.watched.includes(id) || remote.running.includes(id)) remoteWaitingSince.delete(id)
+    }
+    const kept = remote.watched.filter(id => {
+      if (remote.running.includes(id)) return true
+      const since = remoteWaitingSince.get(id) ?? now
+      remoteWaitingSince.set(id, since)
+      if (now - since < MAX_REMOTE_WAIT_MS) return true
+      remoteWaitingSince.delete(id)
+      return false
+    })
+    // Ids added while the answers came are kept.
+    await update($, background, b => ({
+      ...b,
+      remote: remote.running,
+      remoteIds: (b.remoteIds ?? []).filter(id => kept.includes(id) || !ids.includes(id)),
+    }))
+  } finally {
+    isSyncingRemote = false
+  }
+}
+
+// `started` are sessions just started: counted as running at once, in the
+// same write that opens the watch (a look that ends meanwhile clears none).
+async function watchSessions(
+  $: EngineInterface,
+  graceMs: number,
+  isFirstLook = false,
+  started: readonly string[] = [],
+): Promise<void> {
+  unanswered = 0
+  const now = await $.clock.now()
+  await update($, background, b => ({
+    ...b,
+    watchSessions: true,
+    watchUntilMs: Math.max(b.watchUntilMs ?? 0, now + graceMs),
+    ...(started.length === 0
+      ? {}
+      : {
+          startedIds: [...new Set([...(b.startedIds ?? []), ...started])].slice(-MAX_CHECKED),
+          sessions: [...new Set([...(b.sessions ?? []), ...started])],
+          startingUntilMs: now + STARTING_MS,
+        }),
+  }))
+  await syncSessions($, isFirstLook)
+}
 
 // Agents the engine still counts as busy: queued, in a turn, or waiting on
 // background work of their own.
@@ -121,6 +299,10 @@ export const register: Register = on => {
       immediate: true,
     })
 
+    // A turn that was running when the session stopped is over. A reload
+    // of the mod mid-turn clears it too: the band's own prop still shows it.
+    await update($, background, b => (b.isTurnRunning ? { ...b, isTurnRunning: false } : b))
+
     // An early version kept a debug trace of prompt snippets here.
     await $.store.delete('debug')
 
@@ -131,6 +313,15 @@ export const register: Register = on => {
       await syncAgents($)
       await syncShells($)
     })
+
+    // Timers outlive a dispatch only when started here. While the watch is
+    // off a tick reads the state and returns.
+    $.clock.every(SESSIONS_MS, () => syncSessions($))
+    $.clock.every(SESSIONS_MS, () => syncRemote($))
+
+    // A resumed conversation may have started sessions before: one look,
+    // not awaited, so a slow app does not hold up the session's start.
+    if ((await read($, background)).watchSessions === undefined) void watchSessions($, 0, true)
 
     return next(e)
   })
@@ -160,11 +351,13 @@ export const register: Register = on => {
     return { text: isOn ? 'The train is rolling again.' : 'The train is back in the depot.' }
   })
 
-  // The band's own `isWorking` prop follows the main turn. Subagents are
-  // tracked by their own turns, background shells from launch to notice.
+  // The main turn is tracked here too: the band's `isWorking` prop can still
+  // read false when the turn's start redraws it, and nothing redraws the band
+  // when the prop turns true. Subagents are tracked by their own turns,
+  // background shells from launch to notice.
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
-      $.ui.invalidate('ui.render')
+      await update($, background, b => ({ ...b, isTurnRunning: true }))
     } else {
       const id = e.agentId
       await update($, background, b =>
@@ -176,7 +369,10 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
-      $.ui.invalidate('ui.render')
+      // What was started is looked at first, so the train does not stand
+      // until the next look when one came to run meanwhile.
+      await syncSessions($)
+      await update($, background, b => ({ ...b, isTurnRunning: false }))
     } else {
       await syncAgents($)
     }
@@ -202,6 +398,54 @@ export const register: Register = on => {
       })
     }
     return ran
+  })
+
+  // A session started from here works on its own; the main turn may end
+  // while it runs. A suggestion card starts nothing yet, but the person may
+  // start it later, so the watch begins either way.
+  on('tool.call', { tool: 'mcp__ccd_session__start_session' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && !ran.isError) {
+      // Started at once, the answer names the new session; a card names none.
+      const answer = ran.text ?? (typeof ran.result === 'string' ? ran.result : JSON.stringify(ran.result ?? ''))
+      const ids = sessionIds(answer)
+      await watchSessions($, ids.length > 0 ? START_GRACE_MS : CARD_GRACE_MS, false, ids)
+    }
+    return ran
+  })
+
+  // A message to a started session sets it to work again.
+  on('tool.call', { tool: 'mcp__ccd_session_mgmt__send_message' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && !ran.isError) await watchSessions($, START_GRACE_MS)
+    return ran
+  })
+
+  // A cloud session starts its children through Claude Code Remote.
+  on('tool.call', { tool: 'mcp__claude-code-remote__create_session' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && !ran.isError) await syncRemote($, remoteIds(ran.text ?? ran.result))
+    return ran
+  })
+
+  // A message sets the session it names to work again.
+  on('tool.call', { tool: 'mcp__claude-code-remote__send_message' }, async ($, e, next) => {
+    const ran = await next(e)
+    const id = (e as { session_id?: unknown }).session_id
+    if (e.agentId === undefined && !ran.isError && typeof id === 'string') await syncRemote($, [id])
+    return ran
+  })
+
+  // Whatever arrives (a started session reporting back, the app's notice
+  // that one ended its turn) is a good moment to look again rather than wait
+  // for the next tick.
+  on('session.receive', async ($, e, next) => {
+    const received = await next(e)
+    if (e.agentId === undefined) {
+      void syncSessions($)
+      void syncRemote($)
+    }
+    return received
   })
 
   // A stopped shell sends no completion notice.
@@ -240,7 +484,11 @@ export const register: Register = on => {
     const bg = { ...IDLE, ...(await read($, background)) }
     const isAsking = (bg.asking ?? []).length > 0
     const isWorking =
-      (e.props.isWorking && !isAsking) || bg.agents.length > 0 || bg.shells.length > 0
+      ((e.props.isWorking || bg.isTurnRunning === true) && !isAsking) ||
+      bg.agents.length > 0 ||
+      bg.shells.length > 0 ||
+      (bg.sessions ?? []).length > 0 ||
+      (bg.remote ?? []).length > 0
 
     const name = await currentTheme($)
 

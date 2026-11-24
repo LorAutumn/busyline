@@ -3,11 +3,47 @@
 A small train above the Claude Code prompt that rolls while Claude works and
 stands still while it waits for you.
 
-It counts as work: the main turn, subagents still running, and shells sent to
-the background, until they finish or go quiet. While a question or a plan
-waits for your answer, the train stops. It is drawn as block characters in
+It counts as work: the main turn, subagents still running, shells sent to
+the background, until they finish or go quiet, and sessions this one
+started that are still working. While a question or a plan waits for your
+answer, the train stops. It is drawn as block characters in
 the terminal and as an animated SVG in the desktop app, in muted colours so it
 sits on the screen like a watermark.
+
+## Sessions started from this one
+
+The train keeps rolling after the main turn has ended while a session this
+one started is still working, and stands while that session waits for you.
+
+- **Desktop app.** After a `start_session` or a message to a session, the mod
+  asks the app every 10 seconds which of the sessions this one started are
+  running. Only those count: your other sessions, the one that started this
+  one and its siblings do not. A session waiting for a permission or an
+  answer does not count either. The asking ends once nothing started runs
+  and begins again with the next start or message, so a conversation that
+  starts no sessions costs one look at its start.
+- **Cloud sessions.** Sessions started through Claude Code Remote
+  (`create_session`, or written to with `send_message`) are asked about every
+  10 seconds until they complete or fail. `working` counts as work, `blocked`
+  does not: a session that waits for an answer or an approval is still asked
+  about, since it can start working again, for up to six hours of waiting;
+  after that only a message to it starts the asking again. The tests answer as that
+  server did in a cloud session for a working, a blocked and a completed
+  session; a failed one has not been seen there yet.
+
+Things to know:
+
+- The train may take up to 10 seconds to notice that a session finished
+  working, or that one started by the person began. A session Claude starts
+  counts as working at once, for up to 15 seconds before the app reads it as
+  running, so the train does not stand in between; one that ends within
+  that time is noticed up to 15 seconds late.
+- Sessions a subagent starts are not followed.
+- Whether a desktop session waits for you is read from the agent list, which
+  names sessions by title. Two started sessions with the same title count as
+  work as long as one of them is busy.
+- While a permission dialog of the main session is open, the train keeps
+  rolling: nothing tells a mod when the dialog is answered.
 
 ## Install
 
