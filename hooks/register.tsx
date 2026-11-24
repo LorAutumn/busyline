@@ -119,9 +119,15 @@ async function checkSessions($: EngineInterface, isFirstLook: boolean): Promise<
 // written to.
 let isSyncingRemote = false
 let remoteUnanswered = 0
+// A cloud session that waits (on an answer, an approval) may never get
+// one: after this long without working it is no longer asked about. A
+// message to it starts the asking again. Since when each one waits:
+const MAX_REMOTE_WAIT_MS = 6 * 60 * 60 * 1000
+const remoteWaitingSince = new Map<string, number>()
 async function syncRemote($: EngineInterface, added: readonly string[] = []): Promise<void> {
   if (added.length > 0) {
     remoteUnanswered = 0
+    for (const id of added) remoteWaitingSince.delete(id)
     await update($, background, b => ({
       ...b,
       remoteIds: [...new Set([...(b.remoteIds ?? []), ...added])].slice(-MAX_CHECKED),
@@ -137,16 +143,29 @@ async function syncRemote($: EngineInterface, added: readonly string[] = []): Pr
       // No answer: keep what is known, and give up only when it lasts.
       remoteUnanswered += 1
       if (remoteUnanswered >= MAX_UNANSWERED) {
+        remoteWaitingSince.clear()
         await update($, background, b => ({ ...b, remote: [], remoteIds: [] }))
       }
       return
     }
     remoteUnanswered = 0
+    const now = await $.clock.now()
+    for (const id of [...remoteWaitingSince.keys()]) {
+      if (!remote.watched.includes(id) || remote.running.includes(id)) remoteWaitingSince.delete(id)
+    }
+    const kept = remote.watched.filter(id => {
+      if (remote.running.includes(id)) return true
+      const since = remoteWaitingSince.get(id) ?? now
+      remoteWaitingSince.set(id, since)
+      if (now - since < MAX_REMOTE_WAIT_MS) return true
+      remoteWaitingSince.delete(id)
+      return false
+    })
     // Ids added while the answers came are kept.
     await update($, background, b => ({
       ...b,
       remote: remote.running,
-      remoteIds: (b.remoteIds ?? []).filter(id => remote.watched.includes(id) || !ids.includes(id)),
+      remoteIds: (b.remoteIds ?? []).filter(id => kept.includes(id) || !ids.includes(id)),
     }))
   } finally {
     isSyncingRemote = false

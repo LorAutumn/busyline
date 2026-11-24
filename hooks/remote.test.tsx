@@ -217,3 +217,44 @@ test('an object that names no session of its own starts no asking', async ($, on
   expect(calls).toEqual([])
   expect(await moving($)).toBe(false)
 })
+
+// The test clock resolves a limited number of waits in one advance: long
+// stretches pass in steps.
+async function pass(clock: { advance(ms: number): Promise<unknown> }, ms: number) {
+  const step = 10 * 60 * 1000
+  for (let left = ms; left > 0; left -= step) await clock.advance(Math.min(step, left))
+}
+
+test('a cloud session that waits six hours is no longer asked about, until a message', async ($, on) => {
+  const world = { buckets: { [CHILD]: 'blocked' } as Record<string, string> }
+  const calls: string[] = []
+  remote(on, world, calls)
+  creates(on, ccr(CHILD, 'working'))
+  const clock = await start($, on)
+  await $.tool.call({ tool: CREATE, prompt: 'p' })
+
+  await pass(clock, 6 * 60 * 60 * 1000 - 60_000)
+  const before = calls.length
+  await clock.advance(30_000)
+  expect(calls.length).toBeGreaterThan(before)
+
+  await clock.advance(60_000)
+  const after = calls.length
+  await clock.advance(120_000)
+  expect(calls.length).toBe(after)
+
+  world.buckets[CHILD] = 'working'
+  await $.tool.call({ tool: SEND, session_id: CHILD, message: 'go on' })
+  expect(await moving($)).toBe(true)
+})
+
+test('a cloud session that works for more than six hours is still followed', async ($, on) => {
+  const world = { buckets: { [CHILD]: 'working' } as Record<string, string> }
+  remote(on, world)
+  creates(on, ccr(CHILD, 'working'))
+  const clock = await start($, on)
+  await $.tool.call({ tool: CREATE, prompt: 'p' })
+
+  await pass(clock, 7 * 60 * 60 * 1000)
+  expect(await moving($)).toBe(true)
+})
