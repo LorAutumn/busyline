@@ -44,7 +44,7 @@ async function liveness($: EngineInterface, output: string): Promise<Liveness> {
 }
 
 let isSyncingShells = false
-let isSyncingSessions = false
+let sessionsSync: Promise<void> | undefined
 // A check asked for while one runs: it runs again right after.
 let isSyncAgain = false
 // The app may be out of reach for a moment (a reconnect): the watch ends
@@ -56,6 +56,10 @@ let unanswered = 0
 // suggestion card may be started by the person much later.
 const START_GRACE_MS = 60_000
 const CARD_GRACE_MS = 15 * 60 * 1000
+// A session just started counts as running at once, and for this long
+// while the app does not read it as running yet: the main turn may end
+// before it does.
+const STARTING_MS = 15_000
 
 // Ends the watch, unless a start or a message (re)opened it meanwhile: its
 // grace runs past `now`.
@@ -63,7 +67,7 @@ async function endWatch($: EngineInterface, now: number): Promise<void> {
   await update($, background, b =>
     now < (b.watchUntilMs ?? 0)
       ? b
-      : { ...b, watchSessions: false, sessions: [], watchUntilMs: undefined },
+      : { ...b, watchSessions: false, sessions: [], watchUntilMs: undefined, startingUntilMs: undefined },
   )
 }
 
@@ -71,19 +75,24 @@ async function endWatch($: EngineInterface, now: number): Promise<void> {
 // still running. Asked about only while the watch is on: from a start, a
 // message to a session, or the first look at the session's start
 // (`isFirstLook`), until nothing started runs and the grace has passed.
-async function syncSessions($: EngineInterface, isFirstLook = false): Promise<void> {
-  if (isSyncingSessions) {
+// A caller that finds a check running waits for it and the one after.
+function syncSessions($: EngineInterface, isFirstLook = false): Promise<void> {
+  if (sessionsSync !== undefined) {
     isSyncAgain = true
-    return
+    return sessionsSync
   }
-  isSyncingSessions = true
+  sessionsSync = runSessionsSync($, isFirstLook)
+  return sessionsSync
+}
+
+async function runSessionsSync($: EngineInterface, isFirstLook: boolean): Promise<void> {
   try {
     do {
       isSyncAgain = false
       await checkSessions($, isFirstLook)
     } while (isSyncAgain)
   } finally {
-    isSyncingSessions = false
+    sessionsSync = undefined
   }
 }
 
@@ -110,8 +119,20 @@ async function checkSessions($: EngineInterface, isFirstLook: boolean): Promise<
     return
   }
   const known = current.sessions ?? []
-  const same = running.length === known.length && running.every(id => known.includes(id))
-  if (!same) await update($, background, b => ({ ...b, sessions: running }))
+  // One just started that does not read as running yet is held a moment.
+  const starting =
+    now < (current.startingUntilMs ?? 0)
+      ? known.filter(id => !running.includes(id) && !waiting.includes(id))
+      : []
+  const found = [...running, ...starting]
+  const same = found.length === known.length && found.every(id => known.includes(id))
+  // Ones started while the app answered are kept.
+  if (!same) {
+    await update($, background, b => ({
+      ...b,
+      sessions: [...found, ...(b.sessions ?? []).filter(id => !known.includes(id) && !found.includes(id))],
+    }))
+  }
 }
 
 // Cloud sessions this one started through Claude Code Remote: asked about
@@ -172,13 +193,27 @@ async function syncRemote($: EngineInterface, added: readonly string[] = []): Pr
   }
 }
 
-async function watchSessions($: EngineInterface, graceMs: number, isFirstLook = false): Promise<void> {
+// `started` are sessions just started: counted as running at once, in the
+// same write that opens the watch (a look that ends meanwhile clears none).
+async function watchSessions(
+  $: EngineInterface,
+  graceMs: number,
+  isFirstLook = false,
+  started: readonly string[] = [],
+): Promise<void> {
   unanswered = 0
-  const until = (await $.clock.now()) + graceMs
+  const now = await $.clock.now()
   await update($, background, b => ({
     ...b,
     watchSessions: true,
-    watchUntilMs: Math.max(b.watchUntilMs ?? 0, until),
+    watchUntilMs: Math.max(b.watchUntilMs ?? 0, now + graceMs),
+    ...(started.length === 0
+      ? {}
+      : {
+          startedIds: [...new Set([...(b.startedIds ?? []), ...started])].slice(-MAX_CHECKED),
+          sessions: [...new Set([...(b.sessions ?? []), ...started])],
+          startingUntilMs: now + STARTING_MS,
+        }),
   }))
   await syncSessions($, isFirstLook)
 }
@@ -334,6 +369,9 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
+      // What was started is looked at first, so the train does not stand
+      // until the next look when one came to run meanwhile.
+      await syncSessions($)
       await update($, background, b => ({ ...b, isTurnRunning: false }))
     } else {
       await syncAgents($)
@@ -371,13 +409,7 @@ export const register: Register = on => {
       // Started at once, the answer names the new session; a card names none.
       const answer = ran.text ?? (typeof ran.result === 'string' ? ran.result : JSON.stringify(ran.result ?? ''))
       const ids = sessionIds(answer)
-      if (ids.length > 0) {
-        await update($, background, b => ({
-          ...b,
-          startedIds: [...new Set([...(b.startedIds ?? []), ...ids])].slice(-MAX_CHECKED),
-        }))
-      }
-      await watchSessions($, ids.length > 0 ? START_GRACE_MS : CARD_GRACE_MS)
+      await watchSessions($, ids.length > 0 ? START_GRACE_MS : CARD_GRACE_MS, false, ids)
     }
     return ran
   })

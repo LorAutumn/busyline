@@ -172,7 +172,8 @@ test('a finished child does not count', async ($, on) => {
   starts(on, 'local_child-0003')
   const clock = await start($, on)
   await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
-  await clock.advance(10_000)
+  // Just started, it may not read as running yet: held a moment.
+  await clock.advance(20_000)
   expect(await moving($)).toBe(false)
 })
 
@@ -443,5 +444,52 @@ test('a child is still found when this session\'s own id is slow to come', async
   })
   const clock = await start($, on)
   await clock.advance(10_000)
+  expect(await moving($)).toBe(true)
+})
+
+test('a session just started keeps the train rolling before the app reads it as running', async ($, on) => {
+  const world = { rows: [] as Row[] }
+  app(on, world)
+  starts(on, 'local_child-0021')
+  const clock = await start($, on)
+
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  expect(await moving($)).toBe(true)
+  await clock.advance(10_000)
+  expect(await moving($)).toBe(true)
+
+  // It never came to run: the train does not roll on for it.
+  await clock.advance(20_000)
+  expect(await moving($)).toBe(false)
+})
+
+test('a session just started that waits for the person does not move the train', async ($, on) => {
+  const world = {
+    rows: [{ sessionId: 'local_child-0022', isRunning: true, startedBy: SELF, title: 'asks' }] as Row[],
+    statuses: { asks: 'waiting' },
+  }
+  app(on, world)
+  agents(on, world)
+  starts(on, 'local_child-0022')
+  await start($, on)
+
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  expect(await moving($)).toBe(false)
+})
+
+test('the end of the main turn looks at the started sessions at once', async ($, on) => {
+  const world = { rows: [] as Row[] }
+  app(on, world)
+  starts(on, 'local_child-0023')
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  const clock = await start($, on)
+
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.tool.call({ tool: 'mcp__ccd_session__start_session', title: 't', prompt: 'p' })
+  await clock.advance(31_000)
+  // It came to run between two looks.
+  world.rows.push({ sessionId: 'local_child-0023', isRunning: true, startedBy: SELF })
+  await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   expect(await moving($)).toBe(true)
 })

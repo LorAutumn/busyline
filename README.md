@@ -33,8 +33,11 @@ one started is still working, and stands while that session waits for you.
 
 Things to know:
 
-- The train may take up to 10 seconds to notice that a session started or
-  finished working.
+- The train may take up to 10 seconds to notice that a session finished
+  working, or that one started by the person began. A session Claude starts
+  counts as working at once, for up to 15 seconds before the app reads it as
+  running, so the train does not stand in between; one that ends within
+  that time is noticed up to 15 seconds late.
 - Sessions a subagent starts are not followed.
 - Whether a desktop session waits for you is read from the agent list, which
   names sessions by title. Two started sessions with the same title count as
