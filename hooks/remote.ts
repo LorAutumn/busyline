@@ -5,7 +5,8 @@ import type { EngineInterface } from 'claude-code'
 // `status_bucket`. Both answer one JSON object under `ccr`, as seen in a
 // cloud session: `{"ccr":{"id":"session_…","parent_session_id":"session_…",
 // "status_bucket":"SESSION_STATUS_BUCKET_WORKING",…}}`; a finished one reads
-// `…_COMPLETED`. Blocked (on the person) and failed are named likewise.
+// `…_COMPLETED`, one that waits for an answer or an approval `…_BLOCKED`
+// (also seen). Failed is taken to be named likewise.
 const SERVER = 'claude-code-remote'
 
 type Result = { content: ReadonlyArray<{ type: string; text?: string }>; isError?: boolean }
